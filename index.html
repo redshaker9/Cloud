@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AR Game: จับเมฆใส่โหล (MediaPipe Hands)</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600&display=swap" rel="stylesheet">
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { font-family: 'Kanit', sans-serif; overflow: hidden; background-color: #87CEEB; }
+        #output_canvas { position: absolute; left: 0; top: 0; width: 100vw; height: 100vh; object-fit: cover; z-index: 1; }
+        .ui-layer { position: absolute; z-index: 10; width: 100%; pointer-events: none; }
+        .glass-panel { background: rgba(255, 255, 255, 0.2); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.3); }
+        .interactive-btn { pointer-events: auto; cursor: pointer; transition: transform 0.1s; }
+        .interactive-btn:active { transform: scale(0.95); }
+    </style>
+</head>
+<body class="relative w-full h-screen">
+
+    <video id="input_video" class="hidden" autoplay playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <!-- UI ด้านบน -->
+    <div class="ui-layer top-0 p-6 flex justify-between items-start">
+        <div class="glass-panel px-6 py-3 rounded-2xl shadow-lg">
+            <h2 class="text-3xl font-bold text-gray-800 tracking-wide">คะแนน: <span id="scoreDisplay" class="text-blue-600">0</span></h2>
+        </div>
+        
+        <!-- ปุ่มเปิด/ปิดเสียง -->
+        <div id="soundBtn" onclick="toggleSound()" class="glass-panel px-4 py-3 rounded-2xl shadow-lg interactive-btn flex items-center justify-center bg-white/40 hover:bg-white/60">
+            <span id="soundIcon" class="text-3xl">🔊</span>
+        </div>
+
+        <div class="glass-panel px-6 py-3 rounded-2xl shadow-lg">
+            <h2 class="text-3xl font-bold text-gray-800 tracking-wide">เวลา: <span id="timerDisplay" class="text-red-500">60</span>s</h2>
+        </div>
+    </div>
+
+    <!-- หน้าจอโหลด -->
+    <div id="loadingScreen" class="absolute inset-0 z-50 flex flex-col items-center justify-center bg-gray-900 bg-opacity-80 text-white">
+        <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-blue-500 mb-4"></div>
+        <h1 class="text-2xl font-medium">กำลังโหลดโมเดล MediaPipe...</h1>
+        <p class="text-gray-300 mt-2 text-sm">กรุณาอนุญาตการใช้งานกล้อง</p>
+    </div>
+
+    <!-- หน้าจอหมดเวลา -->
+    <div id="gameOverScreen" class="hidden absolute inset-0 z-40 flex flex-col items-center justify-center bg-black bg-opacity-70 text-white">
+        <h1 class="text-6xl font-bold mb-4 drop-shadow-lg text-yellow-400">หมดเวลา!</h1>
+        <p class="text-4xl font-medium mb-8">คุณจับเมฆได้: <span id="finalScoreDisplay">0</span> คะแนน</p>
+        <button onclick="startGame()" class="pointer-events-auto px-8 py-4 bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 rounded-full text-2xl font-bold shadow-xl transition-all transform hover:scale-105">
+            เล่นอีกครั้ง
+        </button>
+    </div>
+
+    <!-- หน้าจอเริ่มเกม -->
+    <div id="startScreen" class="hidden absolute inset-0 z-40 flex flex-col items-center justify-center bg-black bg-opacity-60 text-white">
+        <h1 class="text-5xl font-bold mb-6 text-center leading-tight">เกม AR<br>จับเมฆใส่โหล ☁️</h1>
+        <p class="text-xl mb-8 text-center max-w-md">ใช้นิ้วโป้งและนิ้วชี้ "จีบ" เพื่อหยิบเมฆที่ลอยลงมา แล้วลากไปปล่อยลงในโหลด้านล่างให้ทันเวลา!</p>
+        <button onclick="startGame()" class="pointer-events-auto px-8 py-4 bg-green-500 hover:bg-green-600 rounded-full text-2xl font-bold shadow-xl transition-all transform hover:scale-105">
+            เริ่มเกม
+        </button>
+    </div>
+
+    <script>
+        // ==========================================
+        // ระบบเสียง Web Audio API (Synthesizer)
+        // ==========================================
+        let audioCtx;
+        let masterGain;
+        let isSoundEnabled = true;
+        
+        // ตัวแปรสำหรับระบบ BGM
+        let bgmGainNode;
+        let nextNoteTime = 0;
+        let currentNoteIndex = 0;
+        let bgmTimerID;
+        const bpm = 110; // ความเร็วของเพลง
+        
+        // ชุดโน้ตเพลง (ความถี่ Hz) C Major & F Major Pentatonic
+        const bgmNotes = [
+            261.63, 329.63, 392.00, 523.25, // C4, E4, G4, C5
+            392.00, 329.63, 261.63, 196.00, // G4, E4, C4, G3
+            349.23, 440.00, 523.25, 698.46, // F4, A4, C5, F5
+            523.25, 440.00, 349.23, 261.63  // C5, A4, F4, C4
+        ];
+
+        async function initAudio() {
+            if (!audioCtx) {
+                // สร้าง Audio Context เมื่อผู้ใช้โต้ตอบครั้งแรก (ตามนโยบายเบราว์เซอร์)
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                masterGain = audioCtx.createGain();
+                masterGain.connect(audioCtx.destination);
+                masterGain.gain.value = 0.5; // ระดับเสียงหลัก 50%
+
+                // แชนเนลแยกสำหรับ BGM เพื่อให้เสียงเบากว่า Sound Effect
+                bgmGainNode = audioCtx.createGain();
+                bgmGainNode.gain.value = 0.12; 
+                bgmGainNode.connect(masterGain);
+            }
+            if (audioCtx.state === 'suspended') {
+                await audioCtx.resume(); // ใช้ await เพื่อรอให้ระบบพร้อม 100%
+            }
+        }
+
+        async function toggleSound() {
+            await initAudio(); // เผื่อกรณีกดปุ่มลำโพงก่อนเริ่มเกม
+            isSoundEnabled = !isSoundEnabled;
+            const icon = document.getElementById('soundIcon');
+            if (isSoundEnabled) {
+                masterGain.gain.value = 0.5;
+                icon.innerText = '🔊';
+                if (isPlaying) startBGM(); // เล่น BGM ต่อถ้าเกมกำลังดำเนินอยู่
+            } else {
+                masterGain.gain.value = 0;
+                icon.innerText = '🔇';
+                stopBGM(); // หยุด BGM ชั่วคราว
+            }
+            // เล่นเสียงคลิกปุ่มเบาๆ เพื่อยืนยัน
+            if (isSoundEnabled) playSound('click'); 
+        }
+
+        function playSound(type) {
+            if (!audioCtx || !isSoundEnabled) return;
+
+            const time = audioCtx.currentTime;
+            const osc = audioCtx.createOscillator();
+            const gainNode = audioCtx.createGain();
+
+            osc.connect(gainNode);
+            gainNode.connect(masterGain);
+
+            switch (type) {
+                case 'click':
+                    // เสียงจับเมฆ: สั้น แหลม คล้ายฟองสบู่แตก (Sine wave frequency drop)
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(800, time);
+                    osc.frequency.exponentialRampToValueAtTime(300, time + 0.1);
+                    
+                    gainNode.gain.setValueAtTime(0.8, time);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, time + 0.1);
+                    
+                    osc.start(time);
+                    osc.stop(time + 0.1);
+                    break;
+
+                case 'success':
+                    // เสียงลงโหลสำเร็จ: สดใส 2 ตัวโน้ต (Arpeggio)
+                    osc.type = 'triangle';
+                    // โน้ตตัวแรก (C6)
+                    osc.frequency.setValueAtTime(1046.50, time);
+                    // สไลด์ขึ้นไปโน้ตตัวที่สอง (E6) อย่างรวดเร็ว
+                    osc.frequency.setValueAtTime(1318.51, time + 0.1);
+                    
+                    gainNode.gain.setValueAtTime(0, time);
+                    gainNode.gain.linearRampToValueAtTime(0.6, time + 0.05);
+                    gainNode.gain.linearRampToValueAtTime(0.6, time + 0.15);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, time + 0.4);
+                    
+                    osc.start(time);
+                    osc.stop(time + 0.4);
+                    break;
+
+                case 'error':
+                    // เสียงหลุดมือ/พลาด: เสียงต่ำลง (Sawtooth pitch bend down)
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(300, time);
+                    osc.frequency.exponentialRampToValueAtTime(100, time + 0.3);
+                    
+                    gainNode.gain.setValueAtTime(0.5, time);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, time + 0.3);
+                    
+                    // เพิ่ม Lowpass filter ลดความแสบหูของ Sawtooth
+                    const filter = audioCtx.createBiquadFilter();
+                    filter.type = 'lowpass';
+                    filter.frequency.value = 800;
+                    osc.disconnect();
+                    osc.connect(filter);
+                    filter.connect(gainNode);
+
+                    osc.start(time);
+                    osc.stop(time + 0.3);
+                    break;
+
+                case 'countdown':
+                    // เสียงเตือน 10 วิสุดท้าย: ติ๊กสั้นๆ
+                    osc.type = 'square';
+                    osc.frequency.setValueAtTime(600, time);
+                    
+                    gainNode.gain.setValueAtTime(0, time);
+                    gainNode.gain.linearRampToValueAtTime(0.2, time + 0.01);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, time + 0.05);
+                    
+                    osc.start(time);
+                    osc.stop(time + 0.05);
+                    break;
+
+                case 'gameover':
+                    // เสียงหมดเวลา: ลากยาวและลดระดับเสียงลง
+                    osc.type = 'triangle';
+                    osc.frequency.setValueAtTime(400, time);
+                    osc.frequency.exponentialRampToValueAtTime(50, time + 1.5);
+                    
+                    gainNode.gain.setValueAtTime(0, time);
+                    gainNode.gain.linearRampToValueAtTime(0.7, time + 0.1);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, time + 1.5);
+                    
+                    osc.start(time);
+                    osc.stop(time + 1.5);
+                    break;
+            }
+        }
+
+        // ==========================================
+        // ระบบ Background Music (BGM Scheduler)
+        // ==========================================
+        function nextBgmNote() {
+            const secondsPerBeat = 60.0 / bpm;
+            nextNoteTime += 0.25 * secondsPerBeat; // เล่นทีละจังหวะ 16th note
+            currentNoteIndex++;
+            if (currentNoteIndex >= bgmNotes.length) {
+                currentNoteIndex = 0; // วนลูปกลับไปโน้ตแรก
+            }
+        }
+
+        function scheduleBgmNote(time, freq) {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            
+            osc.type = 'sine'; // ใช้คลื่น Sine ให้เสียงนุ่มๆ คล้าย Kalimba
+            osc.frequency.value = freq;
+            
+            osc.connect(gain);
+            gain.connect(bgmGainNode);
+            
+            // Envelope ของเสียง (เสียงเคาะเบาๆ แล้วค่อยๆ จาง)
+            gain.gain.setValueAtTime(0, time);
+            gain.gain.linearRampToValueAtTime(0.8, time + 0.05); // Attack
+            gain.gain.exponentialRampToValueAtTime(0.001, time + 0.3); // Decay
+            
+            osc.start(time);
+            osc.stop(time + 0.3);
+        }
+
+        function bgmScheduler() {
+            if (!isPlaying || !isSoundEnabled) return;
+            
+            // จองเวลาล่วงหน้า 0.1 วินาที เพื่อให้เสียงไม่กระตุกเวลาเฟรมเรตตก
+            while (nextNoteTime < audioCtx.currentTime + 0.1) {
+                scheduleBgmNote(nextNoteTime, bgmNotes[currentNoteIndex]);
+                nextBgmNote();
+            }
+            bgmTimerID = setTimeout(bgmScheduler, 25); // เรียกใช้ซ้ำทุก 25ms
+        }
+
+        function startBGM() {
+            if (!audioCtx || !isSoundEnabled) return;
+            nextNoteTime = audioCtx.currentTime + 0.1;
+            currentNoteIndex = 0;
+            clearTimeout(bgmTimerID);
+            bgmScheduler();
+        }
+
+        function stopBGM() {
+            clearTimeout(bgmTimerID);
+        }
+
+
+        // ==========================================
+        // ตัวแปรและระบบเกมหลัก
+        // ==========================================
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        
+        const scoreDisplay = document.getElementById('scoreDisplay');
+        const timerDisplay = document.getElementById('timerDisplay');
+        const loadingScreen = document.getElementById('loadingScreen');
+        const startScreen = document.getElementById('startScreen');
+        const gameOverScreen = document.getElementById('gameOverScreen');
+        const finalScoreDisplay = document.getElementById('finalScoreDisplay');
+
+        let isPlaying = false;
+        let score = 0;
+        let timeLeft = 60;
+        let timerInterval = null;
+        let clouds = [];
+        let grabbedCloud = null;
+        
+        let latestImage = null;
+        let handLandmarks = null;
+        let isPinching = false;
+        let wasPinching = false; // เอาไว้เช็คจังหวะเพิ่งเริ่มจีบ
+        let pinchX = 0;
+        let pinchY = 0;
+
+        let jar = { x: 0, y: 0, width: 220, height: 250 };
+
+        function resizeCanvas() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+            jar.x = (canvasElement.width / 2) - (jar.width / 2);
+            jar.y = canvasElement.height - jar.height - 20;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // ---------------------------------------------------------
+        // MediaPipe Hands
+        // ---------------------------------------------------------
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults((results) => {
+            if (!loadingScreen.classList.contains('hidden') && !isPlaying) {
+                loadingScreen.classList.add('hidden');
+                startScreen.classList.remove('hidden');
+            }
+
+            latestImage = results.image;
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                handLandmarks = results.multiHandLandmarks[0];
+                
+                const thumbX = (1 - handLandmarks[4].x) * canvasElement.width;
+                const thumbY = handLandmarks[4].y * canvasElement.height;
+                const indexX = (1 - handLandmarks[8].x) * canvasElement.width;
+                const indexY = handLandmarks[8].y * canvasElement.height;
+
+                const distance = Math.hypot(thumbX - indexX, thumbY - indexY);
+                
+                wasPinching = isPinching; // จำค่าเฟรมที่แล้ว
+                isPinching = distance < 60; 
+                pinchX = (thumbX + indexX) / 2;
+                pinchY = (thumbY + indexY) / 2;
+            } else {
+                handLandmarks = null;
+                wasPinching = isPinching;
+                isPinching = false;
+            }
+        });
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+
+        // ---------------------------------------------------------
+        // Game Logic
+        // ---------------------------------------------------------
+        async function startGame() {
+            await initAudio(); // 🌟 รอให้ Web Audio API พร้อมทำงาน
+            
+            startScreen.classList.add('hidden');
+            gameOverScreen.classList.add('hidden');
+            score = 0;
+            timeLeft = 60;
+            clouds = [];
+            grabbedCloud = null;
+            isPlaying = true; // 🌟 ต้องกำหนดให้เกมเล่นอยู่ก่อน 
+            
+            startBGM();  // 🌟 ค่อยเรียกให้ดนตรีประกอบเริ่มเล่นตรงนี้
+            
+            timerDisplay.classList.remove('text-red-500', 'animate-pulse');
+            updateUI();
+
+            clearInterval(timerInterval);
+            timerInterval = setInterval(() => {
+                timeLeft--;
+                updateUI();
+                
+                // 🌟 เสียง Countdown 10 วิสุดท้าย
+                if (timeLeft <= 10 && timeLeft > 0) {
+                    timerDisplay.classList.add('text-red-500', 'animate-pulse');
+                    playSound('countdown'); 
+                }
+
+                if (timeLeft <= 0) { endGame(); }
+            }, 1000);
+        }
+
+        function endGame() {
+            isPlaying = false;
+            clearInterval(timerInterval);
+            finalScoreDisplay.innerText = score;
+            gameOverScreen.classList.remove('hidden');
+            playSound('gameover'); // 🌟 เสียงตอนหมดเวลา
+            stopBGM(); // 🌟 หยุดเสียงดนตรีประกอบเมื่อจบเกม
+        }
+
+        function updateUI() {
+            scoreDisplay.innerText = score;
+            timerDisplay.innerText = timeLeft;
+        }
+
+        function spawnCloud() {
+            if (!isPlaying) return;
+            const size = Math.random() * 40 + 80;
+            clouds.push({
+                x: Math.random() * (canvasElement.width - size),
+                y: -100,
+                width: size,
+                height: size * 0.6,
+                speed: Math.random() * 2 + 2,
+                id: Math.random()
+            });
+        }
+        setInterval(spawnCloud, 1200);
+
+        // ---------------------------------------------------------
+        // Rendering & Loop
+        // ---------------------------------------------------------
+        function drawCloud(ctx, x, y, w, h, isGrabbed) {
+            ctx.save();
+            ctx.translate(x, y);
+            if (isGrabbed) { ctx.scale(1.1, 1.1); ctx.globalAlpha = 0.8; }
+            
+            ctx.beginPath();
+            ctx.arc(w * 0.3, h * 0.5, h * 0.5, 0, Math.PI * 2);
+            ctx.arc(w * 0.7, h * 0.5, h * 0.4, 0, Math.PI * 2);
+            ctx.arc(w * 0.5, h * 0.2, h * 0.45, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.shadowColor = 'rgba(0, 0, 0, 0.15)';
+            ctx.shadowBlur = 15;
+            ctx.shadowOffsetY = 5;
+            ctx.fill();
+            ctx.restore();
+        }
+
+        function drawJar(ctx) {
+            ctx.save();
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.lineWidth = 4;
+            
+            ctx.beginPath();
+            ctx.roundRect(jar.x, jar.y, jar.width, jar.height, [10, 10, 20, 20]);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.roundRect(jar.x - 10, jar.y - 20, jar.width + 20, 20, 5);
+            ctx.fillStyle = 'rgba(200, 230, 255, 0.5)';
+            ctx.fill();
+            ctx.stroke();
+            
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.font = 'bold 30px Kanit';
+            ctx.textAlign = 'center';
+            ctx.fillText('โหลเก็บเมฆ', jar.x + jar.width / 2, jar.y + jar.height / 2);
+            ctx.restore();
+        }
+
+        function gameLoop() {
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            if (latestImage) {
+                canvasCtx.save();
+                canvasCtx.scale(-1, 1);
+                canvasCtx.translate(-canvasElement.width, 0);
+                canvasCtx.drawImage(latestImage, 0, 0, canvasElement.width, canvasElement.height);
+                
+                if (handLandmarks) {
+                    drawConnectors(canvasCtx, handLandmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 4});
+                    drawLandmarks(canvasCtx, handLandmarks, {color: '#FF0000', lineWidth: 2, radius: 4});
+                }
+                canvasCtx.restore();
+            }
+
+            if (isPlaying) {
+                // จัดการตรรกะการหยิบเมฆ
+                if (isPinching) {
+                    if (!grabbedCloud) {
+                        for (let i = clouds.length - 1; i >= 0; i--) {
+                            let c = clouds[i];
+                            if (pinchX > c.x && pinchX < c.x + c.width && pinchY > c.y && pinchY < c.y + c.height) {
+                                grabbedCloud = c;
+                                // 🌟 จีบโดนเมฆครั้งแรก เล่นเสียง click
+                                if (!wasPinching) playSound('click'); 
+                                break;
+                            }
+                        }
+                    } else {
+                        grabbedCloud.x = pinchX - grabbedCloud.width / 2;
+                        grabbedCloud.y = pinchY - grabbedCloud.height / 2;
+                    }
+                } else {
+                    if (grabbedCloud) {
+                        // ปล่อยนิ้ว -> เช็คว่าปล่อยลงโหลหรือไม่
+                        const cloudCenterX = grabbedCloud.x + grabbedCloud.width / 2;
+                        const cloudCenterY = grabbedCloud.y + grabbedCloud.height / 2;
+                        
+                        if (cloudCenterX > jar.x && cloudCenterX < jar.x + jar.width &&
+                            cloudCenterY > jar.y && cloudCenterY < jar.y + jar.height) {
+                            
+                            score += 100;
+                            updateUI();
+                            playSound('success'); // 🌟 เสียงลงโหลสำเร็จ
+                            clouds = clouds.filter(c => c !== grabbedCloud);
+                        } else {
+                            playSound('error'); // 🌟 เสียงปล่อยผิดที่ (หลุดมือ)
+                        }
+                        grabbedCloud = null;
+                    }
+                }
+
+                drawJar(canvasCtx);
+
+                for (let i = clouds.length - 1; i >= 0; i--) {
+                    let c = clouds[i];
+                    
+                    if (c !== grabbedCloud) {
+                        c.y += c.speed;
+                    }
+
+                    if (c.y > canvasElement.height) {
+                        clouds.splice(i, 1);
+                        continue;
+                    }
+
+                    drawCloud(canvasCtx, c.x, c.y, c.width, c.height, c === grabbedCloud);
+                }
+
+                if (isPinching) {
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(pinchX, pinchY, 15, 0, Math.PI * 2);
+                    canvasCtx.fillStyle = 'rgba(255, 215, 0, 0.6)';
+                    canvasCtx.fill();
+                }
+            }
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
